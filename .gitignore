@@ -1,0 +1,11 @@
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Installed dependencies
+node_modules/
+
+# Logs and test output
+npm-debug.log*
+coverage/
