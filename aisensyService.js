@@ -25,6 +25,12 @@ async function sendAppointmentReminder(appointment) {
         phoneNumber = `+91${phoneNumber}`;
     }
 
+    const [hourString, minute] = String(appointment.appointment_time)
+        .slice(0, 5)
+        .split(":");
+    const hour = Number(hourString);
+    const formattedTime = `${hour % 12 || 12}:${minute} ${hour < 12 ? "AM" : "PM"}`;
+
     const payload = {
         apiKey: API_KEY,
         campaignName: CAMPAIGN_NAME,
@@ -33,7 +39,7 @@ async function sendAppointmentReminder(appointment) {
         templateParams: [
             appointment.patient_name,
             appointment.doctor_name,
-            String(appointment.appointment_time).slice(0, 5),
+            formattedTime,
             appointment.branch
         ]
     };
@@ -80,4 +86,3 @@ async function sendAppointmentReminder(appointment) {
 }
 
 module.exports = { sendAppointmentReminder };
-
