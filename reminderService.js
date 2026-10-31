@@ -1,13 +1,17 @@
-
 const pool = require("./server");
 const aisensyService = require("./aisensyService");
 
 const MAX_RETRIES = 3;
 
+
+// STEP 1: Process the reminders claimed by the scheduler.
 async function processReminders(reminders, workerId) {
+
     for (const reminder of reminders) {
+
         try {
-            // Fetch appointment details from PostgreSQL.
+
+            // STEP 2: Fetch the corresponding appointment.
             const appointmentResult = await pool.query(
                 `
                 SELECT
@@ -26,116 +30,240 @@ async function processReminders(reminders, workerId) {
                 [reminder.appointment_id, reminder.appointment_date]
             );
 
+
+            // STEP 3: Check whether the appointment exists.
             if (appointmentResult.rowCount === 0) {
-                await markFailed(reminder.id, workerId);
+
+                await markFailed(
+                    reminder.id,
+                    workerId,
+                    "Appointment record not found."
+                );
+
                 continue;
             }
 
             const appointment = appointmentResult.rows[0];
 
-            // Send the reminder through AiSensy.
-            const response =
-                await aisensyService.sendAppointmentReminder(appointment);
 
-            if (!response.accepted || !response.messageId) {
-                throw new Error(
-                    "AiSensy did not confirm acceptance with a message ID."
-                );
-            }
-
-            // Record successful submission.
-            const updateResult = await pool.query(
+            // STEP 4: Record that the external request is about to begin.
+            const startResult = await pool.query(
                 `
                 UPDATE appointment_reminders
-                SET reminder_status = 'DONE',
-                    aisensy_message_id = $1,
-                    locked_by = NULL,
-                    locked_at = NULL,
-                    lease_expires_at = NULL,
+                SET send_started_at = NOW(),
                     updated_at = NOW()
-                WHERE id = $2
+                WHERE id = $1
                   AND reminder_status = 'PROCESSING'
-                  AND locked_by = $3
+                  AND locked_by = $2
                 RETURNING id
                 `,
-                [response.messageId, reminder.id, workerId]
+                [reminder.id, workerId]
             );
 
-            if (updateResult.rowCount === 0) {
-                console.error(
-                    `Reminder ${reminder.id}: status was not updated.`
+
+            if (startResult.rowCount === 0) {
+                console.log(
+                    `Reminder ${reminder.id}: Worker no longer owns this reminder.`
                 );
+
                 continue;
             }
 
-            console.log(
-                `Reminder ${reminder.id} marked DONE. ` +
-                `AiSensy message ID: ${response.messageId}`
+
+            // STEP 5: Send the request to AiSensy.
+            // Important: Do not put the database update below
+            // inside a catch that treats it as an API failure.
+            const response =
+                await aisensyService.sendAppointmentReminder(appointment);
+
+
+            // STEP 6: Handle confirmed acceptance.
+            if (response.outcome === "accepted") {
+
+                await markDone(
+                    reminder.id,
+                    workerId,
+                    response.messageId
+                );
+
+                continue;
+            }
+
+
+            // STEP 7: Handle an explicit rejection.
+            if (response.outcome === "rejected") {
+
+                await handleFailure(
+                    reminder.id,
+                    workerId,
+                    response.reason
+                );
+
+                continue;
+            }
+
+
+            // STEP 8: Handle an uncertain submission.
+            if (response.outcome === "unknown") {
+
+                await markSubmissionUnknown(
+                    reminder.id,
+                    workerId,
+                    response.reason
+                );
+
+                continue;
+            }
+
+
+            // STEP 9: Handle a request that was never sent.
+            if (response.outcome === "not_sent") {
+
+                await markFailed(
+                    reminder.id,
+                    workerId,
+                    response.reason
+                );
+
+                continue;
+            }
+
+
+            // Unexpected outcome: do not retry automatically.
+            await markSubmissionUnknown(
+                reminder.id,
+                workerId,
+                "Unexpected AiSensy response outcome."
             );
 
         } catch (error) {
+
             console.error(
-                `Reminder ${reminder.id} processing failed:`,
+                `Reminder ${reminder.id} processing error:`,
                 error.message
             );
 
-            await handleFailure(reminder, workerId);
+            // Deliberately do not reset this reminder to PENDING.
+            //
+            // If send_started_at is populated, recovery will classify
+            // it as SUBMISSION_UNKNOWN.
+            //
+            // If send_started_at is NULL, recovery can safely
+            // return it to PENDING.
         }
     }
 }
 
-async function handleFailure(reminder, workerId) {
-    const client = await pool.connect();
 
-    try {
-        await client.query("BEGIN");
+// STEP 10: Mark a successfully accepted submission as DONE.
+async function markDone(reminderId, workerId, messageId) {
 
-        const result = await client.query(
-            `
-            UPDATE appointment_reminders
-            SET retry_count = retry_count + 1,
-                reminder_status = CASE
-                    WHEN retry_count + 1 >= $1 THEN 'FAILED'
-                    ELSE 'PENDING'
-                END,
-                locked_by = NULL,
-                locked_at = NULL,
-                lease_expires_at = NULL,
-                updated_at = NOW()
-            WHERE id = $2
-              AND reminder_status = 'PROCESSING'
-              AND locked_by = $3
-            RETURNING reminder_status, retry_count
-            `,
-            [MAX_RETRIES, reminder.id, workerId]
+    const result = await pool.query(
+        `
+        UPDATE appointment_reminders
+        SET reminder_status = 'DONE',
+            aisensy_message_id = $1,
+            locked_by = NULL,
+            locked_at = NULL,
+            lease_expires_at = NULL,
+            updated_at = NOW()
+        WHERE id = $2
+          AND reminder_status = 'PROCESSING'
+          AND locked_by = $3
+        RETURNING id
+        `,
+        [messageId, reminderId, workerId]
+    );
+
+
+    if (result.rowCount === 0) {
+
+        throw new Error(
+            `Could not mark reminder ${reminderId} as DONE.`
         );
+    }
 
-        await client.query("COMMIT");
 
-        if (result.rowCount > 0) {
-            console.log(
-                `Reminder ${reminder.id}: ` +
-                `${result.rows[0].reminder_status}, ` +
-                `attempts: ${result.rows[0].retry_count}`
-            );
-        }
+    console.log(
+        `Reminder ${reminderId} marked DONE. Message ID: ${messageId}`
+    );
+}
 
-    } catch (error) {
-        await client.query("ROLLBACK");
+
+// STEP 11: Handle definite API rejection and retry.
+async function handleFailure(reminderId, workerId, reason) {
+
+    const result = await pool.query(
+        `
+        UPDATE appointment_reminders
+        SET retry_count = retry_count + 1,
+
+            reminder_status = CASE
+                WHEN retry_count + 1 >= $1 THEN 'FAILED'
+                ELSE 'PENDING'
+            END,
+
+            send_started_at = NULL,
+            locked_by = NULL,
+            locked_at = NULL,
+            lease_expires_at = NULL,
+            updated_at = NOW()
+
+        WHERE id = $2
+          AND reminder_status = 'PROCESSING'
+          AND locked_by = $3
+
+        RETURNING reminder_status, retry_count
+        `,
+        [MAX_RETRIES, reminderId, workerId]
+    );
+
+
+    if (result.rowCount > 0) {
+
+        console.log(
+            `Reminder ${reminderId}: ` +
+            `${result.rows[0].reminder_status}, ` +
+            `attempts: ${result.rows[0].retry_count}. ` +
+            `Reason: ${reason}`
+        );
+    }
+}
+
+
+// STEP 12: Mark an uncertain submission.
+async function markSubmissionUnknown(reminderId, workerId, reason) {
+
+    const result = await pool.query(
+        `
+        UPDATE appointment_reminders
+        SET reminder_status = 'SUBMISSION_UNKNOWN',
+            locked_by = NULL,
+            locked_at = NULL,
+            lease_expires_at = NULL,
+            updated_at = NOW()
+        WHERE id = $1
+          AND reminder_status = 'PROCESSING'
+          AND locked_by = $2
+        RETURNING id
+        `,
+        [reminderId, workerId]
+    );
+
+
+    if (result.rowCount > 0) {
 
         console.error(
-            "Failed to update reminder status:",
-            error.message
+            `Reminder ${reminderId} requires investigation. ` +
+            `Submission outcome unknown: ${reason}`
         );
-
-        throw error;
-
-    } finally {
-        client.release();
     }
 }
 
-async function markFailed(reminderId, workerId) {
+
+// STEP 13: Mark a reminder as permanently failed.
+async function markFailed(reminderId, workerId, reason) {
+
     await pool.query(
         `
         UPDATE appointment_reminders
@@ -151,10 +279,13 @@ async function markFailed(reminderId, workerId) {
         [reminderId, workerId]
     );
 
+
     console.error(
-        `Reminder ${reminderId} failed: appointment record not found.`
+        `Reminder ${reminderId} marked FAILED: ${reason}`
     );
 }
 
-module.exports = { processReminders };
 
+module.exports = {
+    processReminders
+};
